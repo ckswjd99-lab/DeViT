@@ -6,10 +6,14 @@ from torch.utils.data import DataLoader
 
 from tqdm import tqdm
 
+from augment import RandAugment
 from model import DecoderViT, EncoderViT
 
 # 모델, optimizer, loss function 정의
 device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+
+NUM_EPOCHS = 500
+BATCH_SIZE = 512
 
 PATCH_SIZE = 4
 IN_CHANNELS = 3
@@ -18,6 +22,7 @@ NUM_HEADS = 6
 NUM_LAYERS = 8
 FFN_DIM = 512
 DROPOUT = 0.1
+EMB_DROPOUT = 0.1
 NUM_CLASSES = 10
 
 print(f"[Configurations]")
@@ -42,6 +47,7 @@ model_decoder = DecoderViT(
     mlp_dim=FFN_DIM,
     channels=IN_CHANNELS,
     dropout=DROPOUT,
+    emb_dropout=EMB_DROPOUT,
 ).to(device)
 
 # Encoder-based Vision Transformer 모델
@@ -55,6 +61,7 @@ model_encoder = EncoderViT(
     mlp_dim=FFN_DIM,
     channels=IN_CHANNELS,
     dropout=DROPOUT,
+    emb_dropout=EMB_DROPOUT,
 ).to(device)
 
 # 모델 파라미터 수 계산 및 출력
@@ -72,16 +79,30 @@ scheduler_encoder = optim.lr_scheduler.CosineAnnealingLR(optimizer_encoder, T_ma
 criterion = nn.CrossEntropyLoss()
 
 # 데이터 로드 및 전처리
-transform = transforms.Compose([
+transform_train = transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    transforms.Resize(32),
+    transforms.RandomHorizontalFlip(),
     transforms.ToTensor(),
     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
 ])
 
-train_dataset = datasets.CIFAR10(root='../data', train=True, download=True, transform=transform)
-test_dataset = datasets.CIFAR10(root='../data', train=False, download=True, transform=transform)
+transform_valid = transforms.Compose([
+    transforms.Resize(32),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+])
 
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+# Add RandAugment with N, M(hyperparameter)
+N = 2; M = 14
+transform_train.transforms.insert(0, RandAugment(N, M))
+
+
+train_dataset = datasets.CIFAR10(root='../data', train=True, download=True, transform=transform_train)
+test_dataset = datasets.CIFAR10(root='../data', train=False, download=True, transform=transform_valid)
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 def create_image_pyramid(image):
     """
@@ -141,11 +162,14 @@ def train(model, device, train_loader, optimizer, criterion, is_decoder=True):
         avg_loss = sum_loss / num_data
         accuracy = 100. * correct / num_data
 
-        pbar.set_description(f"Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f} %")
+        pbar.set_description((f"DeViT | " if is_decoder else f"EViT | ") + f"Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f} %")
+
+    return avg_loss, accuracy
 
 
 
 # 평가 루프 (Decoder 모델에 대해 토큰 위치별 평균 loss와 accuracy 계산 및 출력)
+@torch.no_grad()
 def test(model, device, test_loader, criterion, is_decoder=True):
     model.eval()
     test_loss = 0
@@ -157,60 +181,56 @@ def test(model, device, test_loader, criterion, is_decoder=True):
         token_corrects = [0] * model.total_patches # 모든 토큰 위치에 대한 correct를 저장할 리스트 초기화
         token_counts = [0] * model.total_patches  # 모든 토큰 위치에 대한 data 개수를 저장할 리스트 초기화
 
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(device), target.to(device)
+    for data, target in test_loader:
+        data, target = data.to(device), target.to(device)
 
-            if is_decoder:
-                # Image Pyramid 생성
-                pyramid = create_image_pyramid(data)
-                pyramid = [p.to(device) for p in pyramid]
-                output = model(pyramid)  # (batch_size, num_patches, num_classes)
+        if is_decoder:
+            # Image Pyramid 생성
+            pyramid = create_image_pyramid(data)
+            pyramid = [p.to(device) for p in pyramid]
+            output = model(pyramid)  # (batch_size, num_patches, num_classes)
 
-                # 모든 토큰에 대한 loss와 accuracy 계산
-                for i in range(output.shape[1]):
-                    token_losses[i] += criterion(output[:, i, :], target).item() * data.size(0)
-                    pred = output[:, i, :].argmax(dim=1, keepdim=True)
-                    token_corrects[i] += pred.eq(target.view_as(pred)).sum().item()
-                    token_counts[i] += data.size(0) # 해당 위치 토큰을 본 data 개수
-            else:
-                output = model(data)
-                test_loss += criterion(output, target).item() * data.size(0)  # 배치 사이즈 곱하기
-                pred = output.argmax(dim=1, keepdim=True)
-                correct += pred.eq(target.view_as(pred)).sum().item()
+            # 모든 토큰에 대한 loss와 accuracy 계산
+            for i in range(output.shape[1]):
+                token_losses[i] += criterion(output[:, i, :], target).item() * data.size(0)
+                pred = output[:, i, :].argmax(dim=1, keepdim=True)
+                token_corrects[i] += pred.eq(target.view_as(pred)).sum().item()
+                token_counts[i] += data.size(0) # 해당 위치 토큰을 본 data 개수
+        else:
+            output = model(data)
+            test_loss += criterion(output, target).item() * data.size(0)  # 배치 사이즈 곱하기
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
 
     if is_decoder:
         # Decoder 모델의 경우, 토큰 위치별 평균 loss와 accuracy 계산 및 출력
         token_avg_losses = [loss / count for loss, count in zip(token_losses, token_counts)]
         token_avg_accuracies = [100. * correct / count for correct, count in zip(token_corrects, token_counts)]
 
-        print(f"Decoder Test Loss and Accuracy (per each token position):")
+        print(f"\tDecoder Test Loss and Accuracy (per each token position):")
         for i in range(0, model.total_patches, 4):
             avg_loss = sum(token_avg_losses[i:i + 4]) / 4
             avg_accuracy = sum(token_avg_accuracies[i:i + 4]) / 4
-            print(f"- Tokens {i + 1}-{i + 4}: Avg. Loss: {avg_loss:.4f}, Avg. Accuracy: {avg_accuracy:.2f}%")
+            print(f"\t - Tokens {i + 1}-{i + 4}: Avg. Loss: {avg_loss:.4f}, Avg. Accuracy: {avg_accuracy:.2f}%")
 
         return token_avg_losses[-1], token_avg_accuracies[-1]  # 마지막 토큰의 loss와 accuracy 반환
     else:
         test_loss /= len(test_loader.dataset)
         accuracy = 100. * correct / len(test_loader.dataset)
-        print(f"Encoder Test Loss: {test_loss:.4f}, Accuracy: {accuracy:.2f}%")
 
         return test_loss, accuracy
 
 # 학습 및 평가
-for epoch in range(1, 101):
+for epoch in range(1, 1+NUM_EPOCHS):
     print(f"Epoch: {epoch}")
-    print("Training Decoder...")
-    train(model_decoder, device, train_loader, optimizer_decoder, criterion, is_decoder=True)
-    print("Testing Decoder...")
+
+    train_loss_decoder, accuracy_decoder = train(model_decoder, device, train_loader, optimizer_decoder, criterion, is_decoder=True)
     test_loss_decoder, accuracy_decoder = test(model_decoder, device, test_loader, criterion, is_decoder=True)
     scheduler_decoder.step()
-    print(f"Decoder - Epoch: {epoch}, Test Loss: {test_loss_decoder:.4f}, Accuracy: {accuracy_decoder:.2f}%")
+    print(f"(DeViT) EPOCH {epoch:03d}/{NUM_EPOCHS:03d} | T LOSS: {test_loss_decoder:.4f}, T ACC: {accuracy_decoder:.2f}%, V LOSS: {test_loss_decoder:.4f}, V ACC: {accuracy_decoder:.2f}%")
 
-    print("Training Encoder...")
-    train(model_encoder, device, train_loader, optimizer_encoder, criterion, is_decoder=False)
-    print("Testing Encoder...")
+    train_loss_encoder, accuracy_encoder = train(model_encoder, device, train_loader, optimizer_encoder, criterion, is_decoder=False)
     test_loss_encoder, accuracy_encoder = test(model_encoder, device, test_loader, criterion, is_decoder=False)
     scheduler_encoder.step()
-    print(f"Encoder - Epoch: {epoch}, Test Loss: {test_loss_encoder:.4f}, Accuracy: {accuracy_encoder:.2f}%")
+    print(f"(EViT)  EPOCH {epoch:03d}/{NUM_EPOCHS:03d} | T LOSS: {test_loss_encoder:.4f}, T ACC: {accuracy_encoder:.2f}%, V LOSS: {test_loss_encoder:.4f}, V ACC: {accuracy_encoder:.2f}%")
+    print()
