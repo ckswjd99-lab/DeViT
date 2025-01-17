@@ -224,13 +224,15 @@ def test(model, device, test_loader, criterion, is_decoder=True):
 for epoch in range(1, 1+NUM_EPOCHS):
     print(f"Epoch: {epoch}")
 
-    train_loss_decoder, accuracy_decoder = train(model_decoder, device, train_loader, optimizer_decoder, criterion, is_decoder=True)
-    test_loss_decoder, accuracy_decoder = test(model_decoder, device, test_loader, criterion, is_decoder=True)
+    train_loss_decoder, train_accuracy_decoder = train(model_decoder, device, train_loader, optimizer_decoder, criterion, is_decoder=True)
+    test_loss_decoder, test_accuracy_decoder = test(model_decoder, device, test_loader, criterion, is_decoder=True)
     scheduler_decoder.step()
-    print(f"(DeViT) EPOCH {epoch:03d}/{NUM_EPOCHS:03d} | T LOSS: {test_loss_decoder:.4f}, T ACC: {accuracy_decoder:.2f}%, V LOSS: {test_loss_decoder:.4f}, V ACC: {accuracy_decoder:.2f}%")
+    lr_epoch = optimizer_decoder.param_groups[0]['lr']
+    print(f"(DeViT) EPOCH {epoch:03d}/{NUM_EPOCHS:03d}, LR {lr_epoch:.4e} | T LOSS: {test_loss_decoder:.4f}, T ACC: {train_accuracy_decoder:.2f}%, V LOSS: {test_loss_decoder:.4f}, V ACC: {test_accuracy_decoder:.2f}%")
 
-    train_loss_encoder, accuracy_encoder = train(model_encoder, device, train_loader, optimizer_encoder, criterion, is_decoder=False)
-    test_loss_encoder, accuracy_encoder = test(model_encoder, device, test_loader, criterion, is_decoder=False)
+    train_loss_encoder, train_accuracy_encoder = train(model_encoder, device, train_loader, optimizer_encoder, criterion, is_decoder=False)
+    test_loss_encoder, test_accuracy_encoder = test(model_encoder, device, test_loader, criterion, is_decoder=False)
     scheduler_encoder.step()
-    print(f"(EViT)  EPOCH {epoch:03d}/{NUM_EPOCHS:03d} | T LOSS: {test_loss_encoder:.4f}, T ACC: {accuracy_encoder:.2f}%, V LOSS: {test_loss_encoder:.4f}, V ACC: {accuracy_encoder:.2f}%")
+    lr_epoch = optimizer_encoder.param_groups[0]['lr']
+    print(f"(EViT)  EPOCH {epoch:03d}/{NUM_EPOCHS:03d}, LR {lr_epoch:.4e} | T LOSS: {test_loss_encoder:.4f}, T ACC: {train_accuracy_encoder:.2f}%, V LOSS: {test_loss_encoder:.4f}, V ACC: {test_accuracy_encoder:.2f}%")
     print()
