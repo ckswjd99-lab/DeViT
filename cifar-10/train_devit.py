@@ -3,11 +3,13 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
+import sys
 
 from tqdm import tqdm
 
-from augment import RandAugment
+from dataloader import get_cifar10_dataset
 from model import DecoderViT, EncoderViT
+
 
 # 모델, optimizer, loss function 정의
 device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
@@ -50,59 +52,17 @@ model_decoder = DecoderViT(
     emb_dropout=EMB_DROPOUT,
 ).to(device)
 
-# Encoder-based Vision Transformer 모델
-model_encoder = EncoderViT(
-    image_size=32,
-    patch_size=PATCH_SIZE,
-    num_classes=NUM_CLASSES,
-    dim=EMBED_DIM,
-    depth=NUM_LAYERS,
-    heads=NUM_HEADS,
-    mlp_dim=FFN_DIM,
-    channels=IN_CHANNELS,
-    dropout=DROPOUT,
-    emb_dropout=EMB_DROPOUT,
-).to(device)
-
 # 모델 파라미터 수 계산 및 출력
 num_params_decoder = sum(p.numel() for p in model_decoder.parameters() if p.requires_grad)
-num_params_encoder = sum(p.numel() for p in model_encoder.parameters() if p.requires_grad)
 print(f"Number of trainable parameters (Decoder): {num_params_decoder:,d}")
-print(f"Number of trainable parameters (Encoder): {num_params_encoder:,d}")
 
 optimizer_decoder = optim.AdamW(model_decoder.parameters(), lr=1e-4, weight_decay=1e-5)
-optimizer_encoder = optim.AdamW(model_encoder.parameters(), lr=1e-4, weight_decay=1e-5)
 
-scheduler_decoder = optim.lr_scheduler.CosineAnnealingLR(optimizer_decoder, T_max=100)
-scheduler_encoder = optim.lr_scheduler.CosineAnnealingLR(optimizer_encoder, T_max=100)
+scheduler_decoder = optim.lr_scheduler.CosineAnnealingLR(optimizer_decoder, T_max=NUM_EPOCHS)
 
 criterion = nn.CrossEntropyLoss()
 
-# 데이터 로드 및 전처리
-transform_train = transforms.Compose([
-    transforms.RandomCrop(32, padding=4),
-    transforms.Resize(32),
-    transforms.RandomHorizontalFlip(),
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
-
-transform_valid = transforms.Compose([
-    transforms.Resize(32),
-    transforms.ToTensor(),
-    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-])
-
-# Add RandAugment with N, M(hyperparameter)
-N = 2; M = 14
-transform_train.transforms.insert(0, RandAugment(N, M))
-
-
-train_dataset = datasets.CIFAR10(root='../data', train=True, download=True, transform=transform_train)
-test_dataset = datasets.CIFAR10(root='../data', train=False, download=True, transform=transform_valid)
-
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+train_loader, val_loader = get_cifar10_dataset(root='../data', batch_size=BATCH_SIZE)
 
 def create_image_pyramid(image):
     """
@@ -220,19 +180,48 @@ def test(model, device, test_loader, criterion, is_decoder=True):
 
         return test_loss, accuracy
 
+
+# 입력 인자에서 devit, evit의 ckpt를 로드
+if len(sys.argv) == 2:
+    devit_ckpt_path = sys.argv[1]
+
+    devit_ckpt = torch.load(devit_ckpt_path)
+
+    model_decoder.load_state_dict(devit_ckpt['model_state_dict'])
+    optimizer_decoder.load_state_dict(devit_ckpt['optimizer_state_dict'])
+    scheduler_decoder.load_state_dict(devit_ckpt['scheduler_state_dict'])
+
+    start_epoch = devit_ckpt['epoch']
+
+    print(f"Loaded DeViT checkpoint from {devit_ckpt_path}")
+    print(f"Starting from epoch {start_epoch}")
+else:
+    start_epoch = 1
+
+
 # 학습 및 평가
-for epoch in range(1, 1+NUM_EPOCHS):
+for epoch in range(start_epoch, 1+NUM_EPOCHS):
     print(f"Epoch: {epoch}")
 
     train_loss_decoder, train_accuracy_decoder = train(model_decoder, device, train_loader, optimizer_decoder, criterion, is_decoder=True)
-    test_loss_decoder, test_accuracy_decoder = test(model_decoder, device, test_loader, criterion, is_decoder=True)
+    test_loss_decoder, test_accuracy_decoder = test(model_decoder, device, val_loader, criterion, is_decoder=True)
     scheduler_decoder.step()
     lr_epoch = optimizer_decoder.param_groups[0]['lr']
-    print(f"(DeViT) EPOCH {epoch:03d}/{NUM_EPOCHS:03d}, LR {lr_epoch:.4e} | T LOSS: {test_loss_decoder:.4f}, T ACC: {train_accuracy_decoder:.2f}%, V LOSS: {test_loss_decoder:.4f}, V ACC: {test_accuracy_decoder:.2f}%")
-
-    train_loss_encoder, train_accuracy_encoder = train(model_encoder, device, train_loader, optimizer_encoder, criterion, is_decoder=False)
-    test_loss_encoder, test_accuracy_encoder = test(model_encoder, device, test_loader, criterion, is_decoder=False)
-    scheduler_encoder.step()
-    lr_epoch = optimizer_encoder.param_groups[0]['lr']
-    print(f"(EViT)  EPOCH {epoch:03d}/{NUM_EPOCHS:03d}, LR {lr_epoch:.4e} | T LOSS: {test_loss_encoder:.4f}, T ACC: {train_accuracy_encoder:.2f}%, V LOSS: {test_loss_encoder:.4f}, V ACC: {test_accuracy_encoder:.2f}%")
+    print(f"(DeViT) EPOCH {epoch:03d}/{NUM_EPOCHS:03d}, LR {lr_epoch:.4e} | T LOSS: {train_loss_decoder:.4f}, T ACC: {train_accuracy_decoder:.2f}%, V LOSS: {test_loss_decoder:.4f}, V ACC: {test_accuracy_decoder:.2f}%")
     print()
+
+    # save model checkpoint
+    devit_ckpt_path = f"./saves/devit/epoch_{epoch:03d}.pt"
+    devit_ckpt = {
+        'epoch': epoch,
+        'model_state_dict': model_decoder.state_dict(),
+        'optimizer_state_dict': optimizer_decoder.state_dict(),
+        'scheduler_state_dict': scheduler_decoder.state_dict(),
+        'train_loss': train_loss_decoder,
+        'train_accuracy': train_accuracy_decoder,
+        'test_loss': test_loss_decoder,
+        'test_accuracy': test_accuracy_decoder,
+    }
+    torch.save(devit_ckpt, devit_ckpt_path)
+
+
